@@ -1,0 +1,640 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Dict, Optional
+import uvicorn
+import logging
+import cv2
+import numpy as np
+import threading
+import time
+from datetime import datetime
+from collections import deque
+import sys
+import yaml
+import os
+import torch
+from threading import Thread, Lock
+import queue
+from ultralytics import YOLO
+from MetalTheft.mongodb import MongoDBHandlerSaving, MongoDBHandlerFetching
+from MetalTheft.constant import *
+from MetalTheft.exception import MetalTheptException
+from MetalTheft.send_email import EmailSender
+from MetalTheft.utils.utils import send_data_to_dashboard
+from MetalTheft.utils.utils import save_snapshot, save_video, draw_boxes, draw_motion_contours
+from MetalTheft.motion_detection import detect_motion, person_detection_ROI
+from MetalTheft.aws import AWSConfig
+logging.getLogger('ultralytics').setLevel(logging.WARNING)
+from vidgear.gears import CamGear, WriteGear
+from dotenv import load_dotenv
+load_dotenv()
+CC_EMAIL = os.getenv('CC_EMAIL')
+# mongo_handler = MongoDBHandlerSaving()
+aws = AWSConfig()
+email = EmailSender(cc_email = CC_EMAIL)
+CAMERA_IDS = None
+
+
+
+class CameraStream:
+    try:
+        def __init__(self, rtsp_url, camera_id):
+            self.rtsp_url = rtsp_url
+            self.camera_id = camera_id
+            self.cap = CamGear(source=rtsp_url, logging=True).start()
+            self.fps = self.cap.stream.get(cv2.CAP_PROP_FPS)
+            if self.fps and self.fps > 0:
+                print(f"FPS of the video stream {camera_id} is: {self.fps}")
+            else:
+                print("Unable to fetch FPS. Defaulting to 30 FPS.")
+                self.fps = 30  
+
+            self.frame_queue = queue.Queue(maxsize=30)
+            self.stopped = False
+            self.lock = Lock()
+            print(f"Initialized CameraStream for camera {camera_id} with default FPS: {self.fps}")
+            logging.info(f"Initialized CameraStream for camera {camera_id} with default FPS: {self.fps}")
+
+        def start(self):
+            thread = Thread(target=self.update, args=())
+            thread.daemon = True
+            thread.start()
+            return self
+
+        def update(self):
+            while True:
+                if self.stopped:
+                    return
+
+                with self.lock:
+                    if not self.frame_queue.full():
+                        frame = self.cap.read()
+                        if frame is None:
+                            # Restart the camera stream if it fails
+                            self.cap.stop()
+                            self.cap = CamGear(source=self.rtsp_url, logging=True).start()
+                            continue
+
+                        # Clear stale frames to keep the queue fresh
+                        while not self.frame_queue.empty():
+                            try:
+                                self.frame_queue.get_nowait()
+                            except queue.Empty:
+                                break
+
+                        self.frame_queue.put(frame)
+
+                time.sleep(1 / self.fps)  # Adjust for FPS
+
+        def read(self):
+            try:
+                return True, self.frame_queue.get_nowait()
+            except queue.Empty:
+                return False, None
+
+        def stop(self):
+            self.stopped = True
+            with self.lock:
+                self.cap.stop()
+
+    except Exception as e:
+        raise MetalTheptException(e, sys) from e
+
+class CameraProcessor:
+    def __init__(self, camera_id, config):
+        try:
+            self.camera_id = camera_id
+            self.stream = CameraStream(config['RTSP_URL'], camera_id)
+            
+            # Load ROI points from config with validation
+            self.validate_and_load_roi_points(config)
+            
+            # Load other parameters from config with defaults
+            self.thresh_value = config.get('thresh_roi', 25)
+            self.motion_buffer_duration = config.get('motion_buffer_duration', 5)
+            self.motion_buffer_fps = config.get('motion_buffer_fps', 30)
+            self.motion_direction_window = config.get('motion_direction_window', 2.0)
+            
+            # Initialize processing attributes
+            self.aws = AWSConfig()
+            # self.mongo_handler = MongoDBHandler()
+            self.email = EmailSender(cc_email = CC_EMAIL)
+            self.setup_complete = True
+            self.alpha = 0.6
+            self.counter = 1
+            self.last_motion_time = None
+            self.current_time = None
+            self.start_time = None
+            self.motion_detected_flag = False
+            self.roi1_motion_time = None
+            self.roi2_motion_time = None
+            self.recording_after_motion = False
+            self.recording_end_time = None
+            self.video_path = None
+            self.snapshot_path = None
+            self.video_url = None
+            self.snapshot_url = None
+            self.is_processing = False
+            self.object_counter = 0
+            self.frame_count  = 0
+            self.frame_count += 1
+            # Define output parameters for WriteGear
+            self.output_params = {
+                "-input_framerate": 30,
+                "-vcodec": "libx264",
+                "-preset": "ultrafast",
+                "-crf": 22
+            }
+                
+            # Initialize components with error handling
+            self.initialize_components()
+            
+            # Initialize motion buffer
+            self.motion_frame_buffer = deque(maxlen=self.motion_buffer_fps * self.motion_buffer_duration)
+            self.current_people_in_roi3 = 0
+            
+            # Video writer setup
+            self.fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.out_motion = None
+            
+            # Window name
+            self.window_name = f'Camera {self.camera_id}'
+            
+        except Exception as e:
+            logging.error(f"Error initializing CameraProcessor for camera {camera_id}: {str(e)}")
+            raise MetalTheptException(e, sys) from e
+
+    def validate_and_load_roi_points(self, config):
+        """Validate and load ROI points from config"""
+        try:
+            required_rois = ['roi_1_pts_np', 'roi_2_pts_np', 'roi_3_pts_np']
+            for roi in required_rois:
+                if roi not in config:
+                    raise ValueError(f"Missing {roi} in configuration")
+                points = np.array(config[roi], np.int32)
+                if points.size == 0:
+                    raise ValueError(f"Empty points array for {roi}")
+                setattr(self, roi, points)
+            
+            self.roi_1_set = True
+            self.roi_2_set = True
+            self.roi_3_set = True
+            
+        except Exception as e:
+            logging.error(f"Error loading ROI points: {str(e)}")
+            raise MetalTheptException(e, sys) from e
+
+    def initialize_components(self):
+        """Initialize all necessary components with error handling"""
+        try:
+            # Initialize YOLO model
+            # self.model = YOLO('yolov8n.engine', task = 'detect', verbose=True)
+            self.model = YOLO('yolov8n.pt',  verbose=True)
+            
+            # Initialize background subtractor
+            self.fgbg = cv2.createBackgroundSubtractorMOG2(
+                history=500, 
+                varThreshold=20, 
+                detectShadows=True
+            )
+            
+        except Exception as e:
+            logging.error(f"Error initializing components: {str(e)}")
+            raise MetalTheptException(e, sys) from e
+
+    def process_frame(self, frame):
+        if not self.setup_complete:
+            return frame, None
+
+        try:
+            # frame = cv2.resize(frame, (1400, 900))
+            combined_frame1 = frame.copy()
+            combined_frame2 = frame.copy()
+            person_detected = None
+
+            blurred_frame1 = cv2.GaussianBlur(frame, (61, 61), 0)
+            blurred_frame2 = cv2.GaussianBlur(frame, (3, 3), 0)
+
+            combined_frame1, thresh_ROI1 = detect_motion(frame, blurred_frame1, self.fgbg, self.roi_1_pts_np)
+            motion_in_roi1 = cv2.countNonZero(thresh_ROI1) > self.thresh_value
+            motion_mask_1 = np.zeros_like(combined_frame1)
+            cv2.fillPoly(motion_mask_1, [self.roi_1_pts_np], (0, 255, 0))
+            combined_frame1 = cv2.addWeighted(combined_frame1, 0.6, motion_mask_1, 0.4, 0)
+            
+            # Process ROI 2
+            combined_frame2, thresh_ROI2 = detect_motion(frame, blurred_frame2, self.fgbg, self.roi_2_pts_np)
+            motion_in_roi2 = cv2.countNonZero(thresh_ROI2) > self.thresh_value
+            motion_mask_2 = np.zeros_like(frame)
+            cv2.fillPoly(motion_mask_2, [self.roi_2_pts_np], (0,0,0))  
+            combined_frame2 = cv2.addWeighted(combined_frame2, 0.6, motion_mask_2, 0.4, 0)
+
+            # Process ROI 2
+            combined_frame3, person_in_roi3, person_counter = person_detection_ROI(frame=frame, roi_points= self.roi_3_pts_np, model= self.model)
+            cv2.polylines(combined_frame3, [self.roi_3_pts_np], isClosed=True, color=(0, 255, 0), thickness=1)
+            self.current_people_in_roi3 = len(person_in_roi3)
+            
+            # if self.frame_count > 20:
+            #     _, _, person_detected, _ = detect_motion(frame, blurred_frame, model, self.fgbg, self.roi_2_pts_np)
+
+            
+            if self.frame_count > 20:  # ADD COMBINEFRAME2 IN THIS PLACE SO WE CAN TRACK PERSON HERE.
+                combined_frame2, person_detected, _ = person_detection_ROI(frame=combined_frame2, roi_points= self.roi_2_pts_np, model= self.model)
+
+            combined_frame = self.process_motion(frame,
+                combined_frame1, combined_frame2, combined_frame3, motion_in_roi1, person_counter,
+                motion_in_roi2, person_detected, person_in_roi3, thresh_ROI1, thresh_ROI2)
+            
+            self.frame_count += 1
+            
+            return combined_frame, thresh_ROI1
+            
+        except Exception as e:
+            logging.error(f"Error processing camera {self.camera_id}: {str(e)}")
+            return frame, None
+            
+
+    def process_motion(self, frame, combined_frame1, combined_frame2, combined_frame3, motion_in_roi1, 
+                      person_counter, motion_in_roi2, person_detected, person_in_roi3, thresh_ROI1, thresh_ROI2):
+        try:
+            cv2.polylines(combined_frame1, [self.roi_1_pts_np], True, (0, 255, 0), 1)
+            cv2.polylines(combined_frame2, [self.roi_2_pts_np], True, (0, 255, 0), 1)
+            
+            # Process motion in ROI 1 & ROI2
+            if motion_in_roi1:
+                self.roi1_motion_time = time.time()
+                draw_motion_contours(combined_frame1, thresh_ROI1, self.roi_1_pts_np)
+        
+            if motion_in_roi2:
+                self.roi2_motion_time = time.time()
+                # draw_motion_contours(combined_frame2, thresh_ROI2, self.roi_2_pts_np)
+
+        
+            combined_frame = cv2.add(cv2.add(combined_frame1, combined_frame2), combined_frame3)
+            self.motion_frame_buffer.append(combined_frame.copy())
+
+            # Handle recording logic
+            self.current_time = datetime.now()
+            if (motion_in_roi1 and person_detected):
+                if self.last_motion_time is None or (self.current_time - self.last_motion_time).total_seconds() > 3:
+                    if self.roi2_motion_time is not None and (self.roi1_motion_time - self.roi2_motion_time) <= self.motion_direction_window:
+                        motion_in_roi2_to_roi1 = True  
+                        # print("**********************************************\ncamera_id:", self.camera_id, '\nThreshold:', self.thresh_value)
+                        roi_color = (0, 0, 255) if motion_in_roi2_to_roi1 else (0, 255, 0)
+                        cv2.fillPoly(combined_frame, [self.roi_1_pts_np], roi_color)  
+                        self.last_motion_time = self.current_time  
+                        self.object_counter += 1
+
+                    else:
+                        motion_in_roi2_to_roi1 = False 
+
+            if (motion_in_roi1 and person_detected) or (person_in_roi3 and person_detected) or person_in_roi3:
+                if (self.roi2_motion_time is not None and (self.roi1_motion_time - self.roi2_motion_time) <= self.motion_direction_window) or person_in_roi3:
+                    if not self.motion_detected_flag:
+                        self.video_path = save_video()
+                        self.out_motion = WriteGear(
+                                output= self.video_path,  # Changed from output_filename to output
+                                compression_mode=True,
+                                logging=True,
+                                **self.output_params
+                            )
+                        self.snapshot_path = save_snapshot(combined_frame, camera_id=self.camera_id)
+
+                        while self.motion_frame_buffer:
+                            self.out_motion.write(self.motion_frame_buffer.popleft())
+                        self.motion_detected_flag = True
+                        self.recording_after_motion = False
+                        self.motion_frame_buffer.clear()  # Clear the buffer
+
+                    # Write current frame
+                    self.out_motion.write(combined_frame)
+
+            elif self.motion_detected_flag:
+                if not self.recording_after_motion:
+                    self.recording_end_time = time.time() + 5 
+                    self.recording_after_motion = True
+
+                if time.time() <= self.recording_end_time:
+                    self.out_motion.write(combined_frame)
+                else:
+                    self.motion_detected_flag = False
+                    self.recording_after_motion = False
+                    self.out_motion.close()
+                    start_time = datetime.now()
+
+
+                    thread = threading.Thread(target=send_data_to_dashboard, args=(self.video_path, self.snapshot_path, start_time, self.camera_id))
+                    thread.start()
+
+                    self.counter += 1
+                                                        
+                                                
+            # Draw detection boxes
+            cv2.putText(combined_frame, f'Object Count: {self.object_counter}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+            cv2.putText(combined_frame, f'Person Count: {person_counter}', (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
+            
+
+            return combined_frame
+        
+        except Exception as e:
+            raise MetalTheptException(e, sys) from e
+
+class MultiCameraSystem:
+    def __init__(self, config_path):
+        global CAMERA_IDS
+        self.camera_processors = {}
+
+        self.is_running = False
+        self.processing_thread = None
+        
+        # Configure logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s' )
+        # Load configuration
+        try:
+            with open(config_path, 'r') as file:
+                self.config = yaml.safe_load(file)
+        except Exception as e:
+            logging.error(f"Failed to load configuration: {str(e)}")
+            raise MetalTheptException(e, sys) from e
+        
+        # Initialize cameras from config
+        self.initialize_cameras()
+        CAMERA_IDS = list(self.camera_processors.keys())
+
+    def initialize_cameras(self):
+        """Initialize all cameras with error handling"""
+        for camera_name, camera_config in self.config['cameras'].items():
+            try:
+                camera_id = int(camera_name.split('_')[1])
+                processor = CameraProcessor(camera_id, camera_config)
+                processor.stream.start()
+                self.camera_processors[camera_id] = processor
+                logging.info(f"Initialized camera {camera_id} with configuration")
+            except Exception as e:
+                logging.error(f"Failed to initialize camera {camera_name}: {str(e)}")
+                # Continue with other cameras if one fails
+                continue
+
+    def _process_cameras(self):
+        """Main processing loop with enhanced error handling"""
+        logging.info("\nAll cameras configured! Starting monitoring...")
+        
+        while self.is_running:
+            try:
+                for camera_id, processor in self.camera_processors.items():
+                    if processor.stream.stopped:
+                        continue
+                        
+                    ret, frame = processor.stream.read()
+                    if not ret:
+                        continue
+                    
+                    try:
+                        processed_frame, motion = processor.process_frame(frame)
+                        cv2.imshow(processor.window_name, processed_frame)
+                    except Exception as e:
+                        logging.error(f"Error processing camera {camera_id}: {str(e)}")
+                        continue
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    self.stop()
+                    break
+                elif key == ord('a'):
+                    self.reset_all_rois()
+                    
+            except Exception as e:
+                logging.error(f"Error in main _process_cameras loop: {str(e)}")
+                time.sleep(1)  # Prevent tight loop on error
+                continue
+
+    def get_camera_count(self):
+        """Get the total number of cameras in the system"""
+        global CAMERA_IDS
+        return len(CAMERA_IDS) if CAMERA_IDS is not None else 0
+
+    def get_object_counts(self, camera_id: Optional[int] = None) -> dict:
+        """Get object counts for all cameras or a specific camera"""
+        if camera_id is not None:
+            if camera_id in self.camera_processors:
+                processor = self.camera_processors[camera_id]
+                logging.info(f"The number of object count is:{processor.object_counter}, for the Camera_id:{camera_id}")
+                return {camera_id: {"object_count": processor.object_counter}}
+            
+            else:
+                logging.error(f"Failed to get object count for the camera_id:{camera_id}")
+                raise HTTPException(status_code=404, detail=f"Camera ID {camera_id} not found")
+        
+        # If no specific camera_id is provided, return counts for all cameras
+        object_counts = {
+            cam_id: {"object_count": processor.object_counter}
+            for cam_id, processor in self.camera_processors.items()
+        }
+        return object_counts
+
+    def get_people_counts(self, camera_id: Optional[int] = None) -> dict:
+        """Get the current number of people in ROI3 for a specific camera"""
+        if camera_id is not None:
+            if camera_id in self.camera_processors:
+                processor = self.camera_processors[camera_id]
+                logging.info(f"The number of people count is:{processor.current_people_in_roi3}, for the Camera_id:{camera_id}")
+                return {camera_id: {"current_people_in_roi3": processor.current_people_in_roi3}}
+            else:
+                logging.error(f"Failed to get people count for the camera_id:{camera_id}")
+                raise HTTPException(status_code=404, detail=f"Camera ID {camera_id} not found")
+
+        # If no specific camera_id is provided, return counts for all cameras
+        people_counts = {
+            cam_id: {"current_people_in_roi3": processor.current_people_in_roi3}
+            for cam_id, processor in self.camera_processors.items()
+        }
+        return people_counts
+
+
+                
+    def start(self):
+        """Start processing with error handling"""
+        try:
+            if not self.camera_processors:
+                raise Exception("No cameras were successfully initialized")
+                
+            self.is_running = True
+            self.processing_thread = threading.Thread(target=self._process_cameras)
+            self.processing_thread.daemon = True
+            self.processing_thread.start()
+            logging.info("Camera system started successfully")
+        except Exception as e:
+            logging.error(f"Failed to start camera system: {str(e)}")
+            raise MetalTheptException(e,sys) from e
+
+    def cleanup(self):
+        """Cleanup resources"""
+        self.is_running = False
+        if self.processing_thread:
+            self.processing_thread.join()
+        for processor in self.camera_processors.values():
+            processor.stream.stop()
+        cv2.destroyAllWindows()
+
+    def stop(self):
+        """Safely stop all cameras and processing"""
+        self.is_running = False
+        for processor in self.camera_processors.values():
+            processor.stream.stop()
+        cv2.destroyAllWindows()
+        logging.info("Camera system stopped")
+
+
+
+camera_system = None
+try:
+    # camera_system = MultiCameraSystem('MetalTheft/camera.yaml')
+    camera_system = MultiCameraSystem('config.yaml')
+    camera_system.start()
+except Exception as e:
+    raise MetalTheptException(e, sys) from e
+
+
+
+
+app = FastAPI(title="Camera Surveillance System API")
+origins = ["*"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*","Authorization", "Content-Type"],)
+
+
+
+mongo_handler_fetching = MongoDBHandlerFetching()
+@app.get("/")
+def read_root():
+    return {"message": "Welcome to the FastAPI Metal Theft Detection System"}
+
+@app.get("/cameras/count")
+async def get_camera_count():
+    """Get the total number of cameras in the system"""
+    count = camera_system.get_camera_count()
+    return {"camera_count": count}
+
+
+
+@app.get("/camera_ids")
+async def get_camera_ids():
+    global CAMERA_IDS
+    try:
+        if CAMERA_IDS is None or len(CAMERA_IDS) == 0:
+            raise HTTPException(status_code=404, detail="No cameras are available")
+
+        return {
+            "total_cameras": len(CAMERA_IDS), 
+            "camera_ids": CAMERA_IDS
+        }
+    except Exception as e:
+        logging.error(f"Error fetching camera IDs: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+   
+@app.get("/cameras/recent-object-count/{camera_id}")
+async def get_object_count(camera_id: int):
+    """Get object count for a specific camera"""
+    try:
+        count = camera_system.get_object_counts(camera_id=camera_id)
+        return {"counts": count}
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
+
+@app.get("/cameras/people-count/{camera_id}")
+async def get_people_count(camera_id: int):
+    """Get the current number of people in ROI3 for a specific camera"""
+    try:
+        count = camera_system.get_people_counts(camera_id=camera_id)
+        return {"counts": count}
+    except HTTPException as e:
+        return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
+
+@app.get("/snapdate/{year}/{month}/{day}", response_model=List[SnapDate])
+async def get_snapshots(year: int, month: int, day: int, camera_id:int):
+    """Get snapshots by date."""
+    try:
+        snapshots = mongo_handler_fetching.fetch_snapshots_by_date_and_camera(year, month, day, camera_id)
+        if snapshots:
+            return snapshots
+        raise HTTPException(status_code=404, detail="Snapshots not found for the given date")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/snapmonth/{year}/{month}", response_model=List[SnapMonth])
+async def get_snapshots_by_month(year: int, month: int, camera_id:int):
+    """Get snapshots by month."""
+    try:
+        snapshots = mongo_handler_fetching.fetch_snapshots_by_month_and_camera(year, month, camera_id)
+        if snapshots:
+            return snapshots
+        raise HTTPException(status_code=404, detail="No snapshots found for the given month")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/snapdate_count-daywise/{year}/{month}/{day}", response_model=SnapshotCountResponse)
+async def get_snapshots_with_count(year: int, month: int, day: int, camera_id: int):
+    """Get the count of snapshots and their details by date."""
+    try:
+        snapshots = mongo_handler_fetching.fetch_snapshots_by_date_and_camera(year, month, day, camera_id)
+        if snapshots:
+            return SnapshotCountResponse(count=len(snapshots), snapshots=snapshots)
+        raise HTTPException(status_code=404, detail="Snapshots not found for the given date")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/camera_status")
+async def get_camera_status():
+    """Get the status of all cameras: working or not working."""
+    try:
+        camera_status = []
+        total_cameras = len(camera_system.camera_processors)
+
+        for camera_id, processor in camera_system.camera_processors.items():
+            # Check if the camera stream is working
+            working = False  # Default to not working
+            retries = 5  # Number of retries for checking the camera
+
+            for _ in range(retries):
+                ret, frame = processor.stream.read()
+                if ret and frame is not None:
+                    working = True
+                    break  # Exit retry loop if camera is working
+                time.sleep(0.5)  # Wait before retrying
+
+            status = "Working" if working else "Not Working"
+            camera_status.append({"camera_id": camera_id, "status": status})
+
+        return {"total_cameras": total_cameras, "camera_status": camera_status}
+
+    except Exception as e:
+        logging.error(f"Error fetching camera status: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    """Cleanup when shutting down"""    
+    if camera_system:
+        camera_system.cleanup()
+
+if __name__ == "__main__":
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    except Exception as e:
+        print(f"Failed to start server: {str(e)}")
+        if camera_system:
+            camera_system.cleanup()
+
+
+
